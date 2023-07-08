@@ -607,6 +607,24 @@ ngx_ssl_connection_certificate(ngx_connection_t *c, ngx_pool_t *pool,
     return NGX_OK;
 }
 
+static X509 *
+ngx_ssl_engine_load_certificate(ENGINE *engine, const char * cert_id)
+{
+    struct {
+        const char * cert_id;
+        X509 * cert;
+    } load_cert;
+
+    load_cert.cert_id = cert_id;
+    load_cert.cert = NULL;
+
+    /* Note: if certificate is found -- X509 object's ownership is transferred. */
+    if (!ENGINE_ctrl_cmd(engine, "LOAD_CERT_CTRL", 0, &load_cert, NULL, 0)) {
+        return NULL;
+    }
+
+    return load_cert.cert;
+}
 
 static X509 *
 ngx_ssl_load_certificate(ngx_pool_t *pool, char **err, ngx_str_t *cert,
@@ -615,6 +633,50 @@ ngx_ssl_load_certificate(ngx_pool_t *pool, char **err, ngx_str_t *cert,
     BIO     *bio;
     X509    *x509, *temp;
     u_long   n;
+
+    if (ngx_strncmp(cert->data, "engine:", sizeof("engine:") - 1) == 0) {
+
+#ifndef OPENSSL_NO_ENGINE
+
+        u_char  *p, *last;
+        ENGINE  *engine;
+
+        p = cert->data + sizeof("engine:") - 1;
+        last = (u_char *) ngx_strchr(p, ':');
+
+        if (last == NULL) {
+            *err = "invalid syntax";
+            return NULL;
+        }
+
+        *last = '\0';
+
+        engine = ENGINE_by_id((char *) p);
+
+        if (engine == NULL) {
+            *err = "ENGINE_by_id() failed";
+            return NULL;
+        }
+
+        *last++ = ':';
+
+        x509 = ngx_ssl_engine_load_certificate(engine, (char *) last);
+
+        if (x509 == NULL) {
+            *err = "ngx_ssl_engine_load_certificate() failed";
+            return NULL;
+        }
+
+        ENGINE_free(engine);
+        return x509;
+
+#else
+
+        *err = "loading \"engine:...\" certificate is not supported";
+        return NULL;
+
+#endif
+    }
 
     if (ngx_strncmp(cert->data, "data:", sizeof("data:") - 1) == 0) {
 
