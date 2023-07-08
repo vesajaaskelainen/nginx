@@ -63,6 +63,8 @@ void ngx_strlow(u_char *dst, u_char *src, size_t n);
 size_t ngx_strnlen(u_char *p, size_t n);
 
 #define ngx_strchr(s1, c)   strchr((const char *) s1, (int) c)
+#define ngx_strtok_r(str, delim, saveptr) \
+    strtok_r((char *) str, (const char *) delim, (char **) saveptr)
 
 static ngx_inline u_char *
 ngx_strlchr(u_char *p, u_char *last, u_char c)
