@@ -626,13 +626,48 @@ ngx_ssl_engine_load_certificate(ENGINE *engine, const char * cert_id)
     return load_cert.cert;
 }
 
+static ngx_int_t
+ngx_ssl_bio_load_certificate_chain(BIO *bio, STACK_OF(X509) **chain, char **err)
+{
+    X509    *temp;
+    u_long   n;
+
+    for ( ;; ) {
+
+        temp = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+        if (temp == NULL) {
+            n = ERR_peek_last_error();
+
+            if (ERR_GET_LIB(n) == ERR_LIB_PEM
+                && ERR_GET_REASON(n) == PEM_R_NO_START_LINE)
+            {
+                /* end of file */
+                ERR_clear_error();
+                break;
+            }
+
+            /* some real error */
+
+            *err = "PEM_read_bio_X509() failed";
+            return NGX_ERROR;
+        }
+
+        if (sk_X509_push(*chain, temp) == 0) {
+            *err = "sk_X509_push() failed";
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
 static X509 *
 ngx_ssl_load_certificate(ngx_pool_t *pool, char **err, ngx_str_t *cert,
     STACK_OF(X509) **chain)
 {
-    BIO     *bio;
-    X509    *x509, *temp;
-    u_long   n;
+    BIO      *bio;
+    X509     *x509, *temp;
+    ngx_int_t ret;
 
     if (ngx_strncmp(cert->data, "engine:", sizeof("engine:") - 1) == 0) {
 
@@ -644,6 +679,9 @@ ngx_ssl_load_certificate(ngx_pool_t *pool, char **err, ngx_str_t *cert,
         /*
          * Certificates within engine is often specified by URI, in order to
          * support specifying certificate chain use space as delimeter.
+         *
+         * As a side effect loading additional certificates for chain from file
+         * system it cannot handle spaces in the path.
          */
 
         cert_config = ngx_pstrdup(pool, cert);
@@ -752,10 +790,49 @@ ngx_ssl_load_certificate(ngx_pool_t *pool, char **err, ngx_str_t *cert,
                 ENGINE_free(engine);
                 engine = NULL;
             } else {
-                *err = "loading \"engine:...\" certificate from different sources is not supported";
-                X509_free(x509);
-                sk_X509_pop_free(*chain, X509_free);
-                return NULL;
+                ngx_str_t cert_name = chain_cert;
+
+                if (ngx_get_full_name(pool,
+                                      (ngx_str_t *) &ngx_cycle->conf_prefix,
+                                      &cert_name)
+                    != NGX_OK)
+                {
+                    *err = "ngx_get_full_name() failed";
+                    X509_free(x509);
+                    sk_X509_pop_free(*chain, X509_free);
+                    ngx_pfree(pool, cert_config);
+                    return NULL;
+                }
+
+                bio = BIO_new_file((char *) cert_name.data, "r");
+                if (bio == NULL) {
+                    *err = "BIO_new_file() failed";
+                    if (cert_name.data != chain_cert.data) {
+                        /* new allocation -- free it */
+                        ngx_pfree(pool, cert_name.data);
+                    }
+                    X509_free(x509);
+                    sk_X509_pop_free(*chain, X509_free);
+                    ngx_pfree(pool, cert_config);
+                    return NULL;
+                }
+
+                if (cert_name.data != chain_cert.data) {
+                    /* new allocation -- free it */
+                    ngx_pfree(pool, cert_name.data);
+                }
+                ngx_str_null(&cert_name);
+
+                ret = ngx_ssl_bio_load_certificate_chain(bio, chain, err);
+                if (ret != NGX_OK) {
+                    BIO_free(bio);
+                    X509_free(x509);
+                    sk_X509_pop_free(*chain, X509_free);
+                    ngx_pfree(pool, cert_config);
+                    return NULL;
+                }
+
+                BIO_free(bio);
             }
         }
 
@@ -813,36 +890,12 @@ ngx_ssl_load_certificate(ngx_pool_t *pool, char **err, ngx_str_t *cert,
         return NULL;
     }
 
-    for ( ;; ) {
-
-        temp = PEM_read_bio_X509(bio, NULL, NULL, NULL);
-        if (temp == NULL) {
-            n = ERR_peek_last_error();
-
-            if (ERR_GET_LIB(n) == ERR_LIB_PEM
-                && ERR_GET_REASON(n) == PEM_R_NO_START_LINE)
-            {
-                /* end of file */
-                ERR_clear_error();
-                break;
-            }
-
-            /* some real error */
-
-            *err = "PEM_read_bio_X509() failed";
-            BIO_free(bio);
-            X509_free(x509);
-            sk_X509_pop_free(*chain, X509_free);
-            return NULL;
-        }
-
-        if (sk_X509_push(*chain, temp) == 0) {
-            *err = "sk_X509_push() failed";
-            BIO_free(bio);
-            X509_free(x509);
-            sk_X509_pop_free(*chain, X509_free);
-            return NULL;
-        }
+    ret = ngx_ssl_bio_load_certificate_chain(bio, chain, err);
+    if (ret != NGX_OK) {
+        BIO_free(bio);
+        X509_free(x509);
+        sk_X509_pop_free(*chain, X509_free);
+        return NULL;
     }
 
     BIO_free(bio);
