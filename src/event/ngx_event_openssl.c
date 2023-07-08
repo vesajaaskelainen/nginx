@@ -638,14 +638,25 @@ ngx_ssl_load_certificate(ngx_pool_t *pool, char **err, ngx_str_t *cert,
 
 #ifndef OPENSSL_NO_ENGINE
 
-        u_char  *p, *last;
+        u_char  *p, *last, *cert_config, *saveptr;
         ENGINE  *engine;
 
-        p = cert->data + sizeof("engine:") - 1;
+        /*
+         * Certificates within engine is often specified by URI, in order to
+         * support specifying certificate chain use space as delimeter.
+         */
+
+        cert_config = ngx_pstrdup(pool, cert);
+
+        /* just add terminator at next delimeter */
+        (void) ngx_strtok_r(cert_config, " \t\r\n", &saveptr);
+
+        p = cert_config + sizeof("engine:") - 1;
         last = (u_char *) ngx_strchr(p, ':');
 
         if (last == NULL) {
             *err = "invalid syntax";
+            ngx_pfree(pool, cert_config);
             return NULL;
         }
 
@@ -655,6 +666,7 @@ ngx_ssl_load_certificate(ngx_pool_t *pool, char **err, ngx_str_t *cert,
 
         if (engine == NULL) {
             *err = "ENGINE_by_id() failed";
+            ngx_pfree(pool, cert_config);
             return NULL;
         }
 
@@ -664,12 +676,91 @@ ngx_ssl_load_certificate(ngx_pool_t *pool, char **err, ngx_str_t *cert,
 
         if (x509 == NULL) {
             *err = "ngx_ssl_engine_load_certificate() failed";
+            ngx_pfree(pool, cert_config);
             return NULL;
         }
 
         ENGINE_free(engine);
-        return x509;
+        engine = NULL;
 
+        *chain = sk_X509_new_null();
+        if (*chain == NULL) {
+            *err = "sk_X509_new_null() failed";
+            X509_free(x509);
+            ngx_pfree(pool, cert_config);
+            return NULL;
+        }
+
+        /* load certificate chain if defined */
+        for ( ;; ) {
+            ngx_str_t chain_cert = ngx_null_string;
+
+            p = (u_char *) ngx_strtok_r(NULL, " \t\r\n", &saveptr);
+            if (!p) {
+                break;
+            }
+
+            ngx_str_set(&chain_cert, p);
+
+            if (ngx_strncmp(chain_cert.data, "engine:", sizeof("engine:") - 1)
+                == 0) {
+                p = chain_cert.data + sizeof("engine:") - 1;
+                last = (u_char *) ngx_strchr(p, ':');
+
+                if (last == NULL) {
+                    *err = "invalid syntax";
+                    X509_free(x509);
+                    sk_X509_pop_free(*chain, X509_free);
+                    ngx_pfree(pool, cert_config);
+                    return NULL;
+                }
+
+                *last = '\0';
+
+                engine = ENGINE_by_id((char *) p);
+
+                if (engine == NULL) {
+                    *err = "ENGINE_by_id() failed";
+                    X509_free(x509);
+                    sk_X509_pop_free(*chain, X509_free);
+                    ngx_pfree(pool, cert_config);
+                    return NULL;
+                }
+
+                *last++ = ':';
+
+                temp = ngx_ssl_engine_load_certificate(engine, (char *) last);
+
+                if (temp == NULL) {
+                    *err = "ngx_ssl_engine_load_certificate() failed for chain certificate";
+                    X509_free(x509);
+                    sk_X509_pop_free(*chain, X509_free);
+                    ENGINE_free(engine);
+                    ngx_pfree(pool, cert_config);
+                    return NULL;
+                }
+
+                if (sk_X509_push(*chain, temp) == 0) {
+                    *err = "sk_X509_push() failed";
+                    X509_free(x509);
+                    sk_X509_pop_free(*chain, X509_free);
+                    ENGINE_free(engine);
+                    ngx_pfree(pool, cert_config);
+                    return NULL;
+                }
+
+                ENGINE_free(engine);
+                engine = NULL;
+            } else {
+                *err = "loading \"engine:...\" certificate from different sources is not supported";
+                X509_free(x509);
+                sk_X509_pop_free(*chain, X509_free);
+                return NULL;
+            }
+        }
+
+        ngx_pfree(pool, cert_config);
+        return x509;
 #else
 
         *err = "loading \"engine:...\" certificate is not supported";
